@@ -1050,6 +1050,19 @@ def _stack_version_check(repository_ctx, stack_cmd):
     stack_minor_version = int(exec_result.stdout.split(".")[1])
     return stack_major_version >= 2 and stack_minor_version >= 3
 
+def _resolve_component_target_name(package, component):
+    if component in ["lib", "lib:%s" % package]:
+        return package
+    if component.startswith("lib:"):
+        return "_{}_lib_{}".format(package, component[4:])
+    if component == "exe":
+        return "_{}_exe_{}".format(package, package)
+    if component.startswith("exe:"):
+        return "_{}_exe_{}".format(package, component[4:])
+
+    # If the string is not a valid component, it may already be a label so we return it as such.
+    return component
+
 def _parse_components(package, components):
     """Parse and validate a list of Cabal components.
 
@@ -1070,6 +1083,7 @@ def _parse_components(package, components):
     """
     lib = False
     exe = []
+    sublibs = []
 
     for component in components:
         if component == "lib":
@@ -1078,7 +1092,8 @@ def _parse_components(package, components):
             if component == "lib:%s" % package:
                 lib = True
             else:
-                fail("Sublibrary components are not supported: %s in %s" % (component, package), "components")
+                sublibs.append(component[4:])
+
         elif component == "exe":
             exe.append(package)
         elif component.startswith("exe:"):
@@ -1092,14 +1107,14 @@ def _parse_components(package, components):
         if not lib or exe != []:
             fail("Invalid core package components: %s" % package, "components")
 
-    return struct(lib = lib, exe = exe)
+    return struct(lib = lib, exe = exe, sublibs = sublibs)
 
 _default_components = {
-    "alex": struct(lib = False, exe = ["alex"]),
-    "c2hs": struct(lib = False, exe = ["c2hs"]),
-    "cpphs": struct(lib = True, exe = ["cpphs"]),
-    "doctest": struct(lib = True, exe = ["doctest"]),
-    "happy": struct(lib = False, exe = ["happy"]),
+    "alex": struct(lib = False, exe = ["alex"], sublibs = []),
+    "c2hs": struct(lib = False, exe = ["c2hs"], sublibs = []),
+    "cpphs": struct(lib = True, exe = ["cpphs"], sublibs = []),
+    "doctest": struct(lib = True, exe = ["doctest"], sublibs = []),
+    "happy": struct(lib = False, exe = ["happy"], sublibs = []),
 }
 
 def _get_components(components, package):
@@ -1109,7 +1124,7 @@ def _get_components(components, package):
     will be taken from the `_default_components`. If it is not listed
     there then it will default to a library and no executable components.
     """
-    return components.get(package, _default_components.get(package, struct(lib = True, exe = [])))
+    return components.get(package, _default_components.get(package, struct(lib = True, exe = [], sublibs = [])))
 
 def _parse_json_field(json, field, ty, errmsg):
     """Read and type-check a field from a JSON object.
@@ -1917,6 +1932,11 @@ def _stack_snapshot_impl(repository_ctx):
     extra_deps = _to_string_keyed_label_list_dict(repository_ctx.attr.extra_deps)
     tools = [_label_to_string(label) for label in repository_ctx.attr.tools]
 
+    components_dependencies = {
+        comp: json_parse(deps)
+        for comp, deps in repository_ctx.attr.components_dependencies.items()
+    }
+
     # Write out dependency graph as importable Starlark value.
     repository_ctx.file(
         "packages.bzl",
@@ -1930,6 +1950,7 @@ packages = {
                 version = spec["version"],
                 library = all_components[name].lib,
                 executables = all_components[name].exe,
+                sublibs = all_components[name].sublibs,
                 deps = [
                     Label("@{}//:{}".format(repository_ctx.name, dep))
                     for dep in spec["dependencies"]
@@ -1965,6 +1986,7 @@ load("@rules_haskell//haskell:defs.bzl", "haskell_library", "haskell_toolchain_l
         version = spec["version"]
         package = "%s-%s" % (name, version)
         visibility = visibilities[name]
+        package_components_dependencies = components_dependencies.get(name, {})
         if name in vendored_packages:
             build_file_builder.append(
                 """
@@ -2000,6 +2022,13 @@ haskell_library(
                 _label_to_string(label)
                 for label in extra_deps.get(name, [])
             ]
+
+            main_lib_deps = [
+                _resolve_component_target_name(name, c)
+                for lib in ["lib", "lib:{}".format(name)]
+                for c in package_components_dependencies.get(lib, [])
+            ]
+
             library_tools = [
                 "_%s_exe_%s" % (dep, exe)
                 for dep in spec["dependencies"]
@@ -2032,7 +2061,7 @@ haskell_cabal_library(
                         haddock = repr(repository_ctx.attr.haddock),
                         flags = repository_ctx.attr.flags.get(name, []),
                         dir = package,
-                        deps = library_deps,
+                        deps = library_deps + main_lib_deps,
                         setup_deps = setup_deps,
                         tools = library_tools,
                         visibility = visibility,
@@ -2047,6 +2076,11 @@ haskell_cabal_library(
                     ),
                 )
             for exe in all_components[name].exe:
+                exe_component_deps = [
+                    _resolve_component_target_name(name, comp_dep)
+                    for comp in ["exe:{}".format(exe)] + (["exe"] if exe == name else [])
+                    for comp_dep in package_components_dependencies.get(comp, [])
+                ]
                 build_file_builder.append(
                     """
 haskell_cabal_binary(
@@ -2066,10 +2100,47 @@ haskell_cabal_binary(
                         exe = exe,
                         flags = repository_ctx.attr.flags.get(name, []),
                         dir = package,
-                        deps = library_deps + ([name] if all_components[name].lib else []),
+                        deps = library_deps + exe_component_deps + ([name] if all_components[name].lib else []),
+                        # setup_deps = setup_deps,
+                        tools = library_tools,
+                        verbose = repr(repository_ctx.attr.verbose),
+                    ),
+                )
+            for sublib in all_components[name].sublibs:
+                sublib_component_deps = [
+                    _resolve_component_target_name(name, c)
+                    for c in package_components_dependencies.get("lib:".format(sublib), [])
+                ]
+                build_file_builder.append(
+                    """
+haskell_cabal_library(
+    name = "_{name}_lib_{sublib}",
+    package_name = "{name}",
+    version = "{version}",
+    haddock = {haddock},
+    sublibrary_name = "{sublib}",
+    flags = {flags},
+    srcs = glob(["{dir}/**"]),
+    deps = {deps},
+    setup_deps = {setup_deps},
+    tools = {tools},
+    visibility = {visibility},
+    cabalopts = ["--ghc-option=-w", "--ghc-option=-optF=-w"],
+    verbose = {verbose},
+)
+""".format(
+                        workspace = repository_ctx.name,
+                        name = name,
+                        version = version,
+                        haddock = repr(repository_ctx.attr.haddock),
+                        sublib = sublib,
+                        flags = repository_ctx.attr.flags.get(name, []),
+                        dir = package,
+                        deps = library_deps + sublib_component_deps,
                         setup_deps = setup_deps,
                         tools = library_tools,
                         verbose = repr(repository_ctx.attr.verbose),
+                        visibility = visibility,
                     ),
                 )
     build_file_content = "\n".join(build_file_builder)
@@ -2104,6 +2175,7 @@ _stack_snapshot = repository_rule(
         "setup_deps": attr.string_list_dict(),
         "tools": attr.label_list(),
         "components": attr.string_list_dict(),
+        "components_dependencies": attr.string_dict(),
         "stack": attr.label(),
         "stack_update": attr.label(),
         "verbose": attr.bool(default = False),

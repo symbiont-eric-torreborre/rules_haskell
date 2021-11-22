@@ -115,8 +115,20 @@ stack_snapshot(
 
 stack_snapshot(
     name = "stackage-pinning-test",
+    components = {
+        "binaryen": [
+            "lib:libbinaryen",
+            "lib:binaryen",
+        ],
+    },
+    components_dependencies = {
+        "binaryen": """{"lib:binaryen": ["lib:libbinaryen"]}""",
+    },
     local_snapshot = "//:stackage-pinning-test.yaml",
-    packages = ["hspec"],
+    packages = [
+        "binaryen",
+        "hspec",
+    ],
     stack_snapshot_json = "//:stackage-pinning-test_snapshot.json" if not is_windows else None,
 )
 

@@ -9,3 +9,6 @@ packages:
       - hspec-contrib
       - hspec-core
       - hspec-discover
+
+  - github: tweag/haskell-binaryen
+    commit: "7d0ea214e47946fc830d332a6e3e1b73f60f61fd"

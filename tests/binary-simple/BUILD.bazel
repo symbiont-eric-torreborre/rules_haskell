@@ -11,7 +11,10 @@ haskell_test(
     expected_covered_expressions_percentage = 100,
     tags = ["coverage-compatible"],
     visibility = ["//visibility:public"],
-    deps = ["//tests/hackage:base"],
+    deps = [
+        "//tests/hackage:base",
+        "@stackage-pinning-test//:binaryen",
+    ],
 )
 
 filegroup(
